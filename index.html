@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stockfish Chess Trainer</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+</head>
+<body>
+  <main class="app">
+    <section class="card game-card">
+      <div class="topbar">
+        <h1>Stockfish Chess Trainer</h1>
+        <div id="status" class="status-pill">Choose settings, then start.</div>
+      </div>
+
+      <div class="play-area">
+        <div class="board-wrap">
+          <div id="board" aria-label="Chess board"></div>
+        </div>
+
+        <aside class="eval-panel">
+          <div class="eval-bar" aria-label="Evaluation bar">
+            <div id="evalBlack" class="eval-black" style="height: 50%;"></div>
+            <div id="evalWhite" class="eval-white" style="height: 50%;"></div>
+            <div class="eval-mid"></div>
+            <div class="eval-label top">Black</div>
+            <div class="eval-label bottom">White</div>
+          </div>
+          <div class="eval-readout">
+            <strong id="evalValue">0.00</strong>
+            <span id="evalText">Even position</span>
+          </div>
+        </aside>
+      </div>
+
+      <div class="controls">
+        <button id="startBtn" class="primary">Start Game</button>
+        <button id="newBtn">New Game</button>
+        <button id="undoBtn">Undo</button>
+        <button id="flipBtn">Flip Board</button>
+      </div>
+    </section>
+
+    <aside class="card side-card">
+      <div class="mini-grid">
+        <div class="field">
+          <label for="sideSelect">Your Side</label>
+          <select id="sideSelect">
+            <option value="w">White</option>
+            <option value="b">Black</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="eloSelect">Bot ELO</label>
+          <select id="eloSelect">
+            <option value="700">700</option>
+            <option value="900">900</option>
+            <option value="1100" selected>1100</option>
+            <option value="1300">1300</option>
+            <option value="1500">1500</option>
+            <option value="1700">1700</option>
+            <option value="1900">1900</option>
+            <option value="2200">2200</option>
+            <option value="2600">2600</option>
+          </select>
+        </div>
+      </div>
+
+      <p id="engineLine" class="engine-line"><strong>Engine:</strong> loading Stockfish...</p>
+
+      <div class="hint-box">
+        Click one of your pieces. Green/yellow/red move bubbles show the evaluation after that move from your perspective. Example: <strong>+1.20</strong> means you are about 1.2 pawns better after choosing that move.
+      </div>
+
+      <h2>Move History + Review</h2>
+      <div id="history" class="history"></div>
+    </aside>
+  </main>
+
+  <div id="promotionModal" class="modal" role="dialog" aria-modal="true" aria-label="Pawn promotion">
+    <div class="promo-box">
+      <h3>Promote pawn to</h3>
+      <div class="promo-options">
+        <button data-promo="q" title="Queen">♕</button>
+        <button data-promo="r" title="Rook">♖</button>
+        <button data-promo="b" title="Bishop">♗</button>
+        <button data-promo="n" title="Knight">♘</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const STOCKFISH_URL = "https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js";
+      const files = "abcdefgh";
+      const pieceSymbols = {
+        w: { p: "♙", n: "♘", b: "♗", r: "♖", q: "♕", k: "♔" },
+        b: { p: "♟", n: "♞", b: "♝", r: "♜", q: "♛", k: "♚" }
+      };
+      const pieceValue = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 100 };
+
+      const boardEl = document.getElementById("board");
+      const statusEl = document.getElementById("status");
+      const historyEl = document.getElementById("history");
+      const evalWhiteEl = document.getElementById("evalWhite");
+      const evalBlackEl = document.getElementById("evalBlack");
+      const evalValueEl = document.getElementById("evalValue");
+      const evalTextEl = document.getElementById("evalText");
+      const engineLineEl = document.getElementById("engineLine");
+      const promotionModal = document.getElementById("promotionModal");
+      const startBtn = document.getElementById("startBtn");
+      const newBtn = document.getElementById("newBtn");
+      const undoBtn = document.getElementById("undoBtn");
+      const flipBtn = document.getElementById("flipBtn");
+      const sideSelect = document.getElementById("sideSelect");
+      const eloSelect = document.getElementById("eloSelect");
+
+      let chess = new Chess();
+      let engine = null;
+      let gameStarted = false;
+      let humanColor = "w";
+      let botColor = "b";
+      let boardFlipped = false;
+      let selectedSquare = null;
+      let legalMoves = [];
+      let moveScores = new Map();
+      let hintRunId = 0;
+      let currentWhiteEval = 0;
+      let botThinking = false;
+      let pendingPromotion = null;
+      let lastMove = null;
+      let reviewRows = [];
+      let positionStack = [];
+
+      startBtn.addEventListener("click", startGame);
+      newBtn.addEventListener("click", resetGame);
+      undoBtn.addEventListener("click", undoMovePair);
+      flipBtn.addEventListener("click", () => {
+        boardFlipped = !boardFlipped;
+        render();
+      });
+
+      document.querySelectorAll(".promo-options button").forEach(button => {
+        button.addEventListener("click", () => {
+          if (!pendingPromotion) return;
+          const promotion = button.dataset.promo;
+          const move = legalMoves.find(m => m.from === pendingPromotion.from && m.to === pendingPromotion.to && m.promotion === promotion);
+          promotionModal.classList.remove("show");
+          pendingPromotion = null;
+          if (move) playHumanMove(move, promotion);
+        });
+      });
+
+      const handleEngineStatus = message => {
+        engineLineEl.innerHTML = `<strong>Engine:</strong> ${message}`;
+      };
+
+      function startGame() {
+        humanColor = sideSelect.value;
+        botColor = humanColor === "w" ? "b" : "w";
+        boardFlipped = humanColor === "b";
+        gameStarted = true;
+        sideSelect.disabled = true;
+        eloSelect.disabled = true;
+        startBtn.disabled = true;
+        setStatus(`${humanColor === "w" ? "Your" : "Stockfish's"} move.`);
+        requestPositionEval();
+        render();
+        if (chess.turn() === botColor) setTimeout(makeBotMove, 350);
+      }
+
+      function resetGame() {
+        engine.cancelGroup("hint");
+        hintRunId++;
+        chess = new Chess();
+        gameStarted = false;
+        selectedSquare = null;
+        legalMoves = [];
+        moveScores.clear();
+        pendingPromotion = null;
+        lastMove = null;
+        botThinking = false;
+        reviewRows = [];
+        positionStack = [];
+        currentWhiteEval = 0;
+        sideSelect.disabled = false;
+        eloSelect.disabled = false;
+        startBtn.disabled = false;
+        setStatus("Choose settings, then start.");
+        updateEvalBar(0);
+        render();
+      }
+
+      function undoMovePair() {
+        if (botThinking || pendingPromotion || !positionStack.length) return;
+        engine.cancelGroup("hint");
+        hintRunId++;
+
+        const targetLength = Math.max(0, positionStack.length - 2);
+        if (positionStack[targetLength]) {
+          chess = new Chess(positionStack[targetLength].fenBefore);
+        } else {
+          chess = new Chess();
+        }
+
+        reviewRows = reviewRows.slice(0, Math.max(0, reviewRows.length - 2));
+        positionStack = positionStack.slice(0, targetLength);
+        lastMove = positionStack.length ? positionStack[positionStack.length - 1].lastMove : null;
+        selectedSquare = null;
+        legalMoves = [];
+        moveScores.clear();
+        setStatus(isHumanTurn() ? "Your move." : "Stockfish to move.");
+        requestPositionEval();
+        render();
+        if (gameStarted && chess.turn() === botColor) setTimeout(makeBotMove, 250);
+      }
+
+      function onSquareClick(square) {
+        if (!gameStarted || botThinking || !isHumanTurn() || chess.game_over()) return;
+        const piece = chess.get(square);
+
+        if (selectedSquare) {
+          const targetMoves = legalMoves.filter(m => m.to === square);
+          if (targetMoves.length) {
+            const promotionMoves = targetMoves.filter(m => m.flags.includes("p"));
+            if (promotionMoves.length) {
+              pendingPromotion = { from: selectedSquare, to: square };
+              openPromotionModal();
+              return;
+            }
+            playHumanMove(targetMoves[0]);
+            return;
+          }
+
+          if (piece && piece.color === humanColor) {
+            selectSquare(square);
+          } else {
+            clearSelection();
+          }
+          return;
+        }
+
+        if (piece && piece.color === humanColor) selectSquare(square);
+      }
+
+      function selectSquare(square) {
+        selectedSquare = square;
+        legalMoves = chess.moves({ square, verbose: true });
+        moveScores.clear();
+        render();
+        analyzeSelectedMoves(square, legalMoves);
+      }
+
+      function clearSelection() {
+        selectedSquare = null;
+        legalMoves = [];
+        moveScores.clear();
+        hintRunId++;
+        engine.cancelGroup("hint");
+        render();
+      }
+
+      function playHumanMove(move, promotion = "q") {
+        const beforeFen = chess.fen();
+        engine.cancelGroup("hint");
+        hintRunId++;
+        selectedSquare = null;
+        legalMoves = [];
+        moveScores.clear();
+
+        const played = chess.move({ from: move.from, to: move.to, promotion: move.promotion || promotion });
+        if (!played) return;
+        afterMove(beforeFen, played, humanColor);
+        render();
+
+        if (!chess.game_over()) {
+          setTimeout(makeBotMove, 350);
+        }
+      }
+
+      async function makeBotMove() {
+        if (!gameStarted || chess.game_over() || chess.turn() !== botColor || botThinking) return;
+        botThinking = true;
+        selectedSquare = null;
+        legalMoves = [];
+        moveScores.clear();
+        setStatus("Stockfish is thinking...");
+        render();
+
+        const beforeFen = chess.fen();
+        const elo = Number(eloSelect.value);
+        let bestmove = null;
+
+        try {
+          const result = await engine.bestMove(beforeFen, elo, eloToMoveTime(elo));
+          bestmove = result.bestmove;
+        } catch (error) {
+          bestmove = null;
+        }
+
+        let move = null;
+        const legal = chess.moves({ verbose: true });
+        if (bestmove) {
+          const from = bestmove.slice(0, 2);
+          const to = bestmove.slice(2, 4);
+          const promo = bestmove[4] || undefined;
+          move = legal.find(m => m.from === from && m.to === to && (!promo || m.promotion === promo));
+        }
+
+        if (!move) move = pickFallbackBotMove(legal, elo);
+
+        const played = chess.move({ from: move.from, to: move.to, promotion: move.promotion || "q" });
+        botThinking = false;
+        if (played) afterMove(beforeFen, played, botColor);
+        render();
+      }
+
+      function afterMove(beforeFen, playedMove, moverColor) {
+        const afterFen = chess.fen();
+        lastMove = { from: playedMove.from, to: playedMove.to };
+        const row = {
+          san: playedMove.san,
+          color: moverColor,
+          tag: "Analyzing",
+          tagClass: "pending",
+          loss: null
+        };
+        reviewRows.push(row);
+        positionStack.push({ fenBefore: beforeFen, fenAfter: afterFen, lastMove: { ...lastMove } });
+        updateGameStatus();
+        requestPositionEval();
+        classifyMoveAsync(beforeFen, afterFen, playedMove, moverColor, row);
+      }
+
+      async function classifyMoveAsync(beforeFen, afterFen, playedMove, moverColor, row) {
+        try {
+          const depth = 10;
+          const before = await engine.analyze(beforeFen, depth, "review");
+          const after = await engine.analyze(afterFen, depth, "review");
+
+          const bestForMover = scoreToPawns(before.score);
+          const actualForMover = -scoreToPawns(after.score);
+          const loss = bestForMover - actualForMover;
+          const sacrifice = looksLikeSacrifice(beforeFen, afterFen, playedMove, moverColor);
+          const classified = classifyLoss(loss, playedMove, sacrifice);
+          row.tag = classified.label;
+          row.tagClass = classified.className;
+          row.loss = loss;
+          renderHistory();
+        } catch (error) {
+          row.tag = "Review off";
+          row.tagClass = "pending";
+          renderHistory();
+        }
+      }
+
+      function classifyLoss(loss, move, sacrifice) {
+        const san = move.san || "";
+        if (san.includes("#")) return { label: "Brilliant", className: "brilliant" };
+        if (sacrifice && loss <= 0.25) return { label: "Brilliant", className: "brilliant" };
+        if (loss <= 0.08) return { label: "Best", className: "best" };
+        if (loss <= 0.22) return { label: "Excellent", className: "excellent" };
+        if (loss <= 0.55) return { label: "Good", className: "good" };
+        if (loss <= 1.05) return { label: "Inaccuracy", className: "inaccuracy" };
+        if (loss <= 1.8) return { label: "Miss", className: "miss" };
+        if (loss <= 3.4) return { label: "Mistake", className: "mistake" };
+        return { label: "Blunder", className: "blunder" };
+      }
+
+      function looksLikeSacrifice(beforeFen, afterFen, move, moverColor) {
+        try {
+          const before = new Chess(beforeFen);
+          const movedPiece = before.get(move.from);
+          const captured = before.get(move.to);
+          if (!movedPiece) return false;
+          const capturedValue = captured ? pieceValue[captured.type] : 0;
+          const movedValue = pieceValue[movedPiece.type] || 0;
+          if (movedValue <= capturedValue + 1) return false;
+
+          const after = new Chess(afterFen);
+          const opponentMoves = after.moves({ verbose: true });
+          return opponentMoves.some(m => m.to === move.to && m.captured === movedPiece.type);
+        } catch (error) {
+          return false;
+        }
+      }
+
+      function analyzeSelectedMoves(square, moves) {
+        const runId = ++hintRunId;
+        engine.cancelGroup("hint");
+        const unique = uniqueTargetMoves(moves);
+        unique.forEach(move => {
+          moveScores.set(move.to, { loading: true });
+        });
+        render();
+
+        unique.forEach(async move => {
+          try {
+            const clone = new Chess(chess.fen());
+            clone.move({ from: move.from, to: move.to, promotion: move.promotion || "q" });
+            const result = await engine.analyze(clone.fen(), 8, "hint");
+            if (runId !== hintRunId || selectedSquare !== square) return;
+            const scoreForMover = -scoreToPawns(result.score);
+            const currentForMover = chess.turn() === humanColor ? (humanColor === "w" ? currentWhiteEval : -currentWhiteEval) : 0;
+            const delta = scoreForMover - currentForMover;
+            moveScores.set(move.to, { loading: false, score: scoreForMover, delta });
+            renderBoard();
+          } catch (error) {
+            if (runId !== hintRunId) return;
+            moveScores.set(move.to, { loading: false, score: null, delta: 0 });
+            renderBoard();
+          }
+        });
+      }
+
+      function uniqueTargetMoves(moves) {
+        const map = new Map();
+        moves.forEach(move => {
+          const existing = map.get(move.to);
+          if (!existing || move.promotion === "q") map.set(move.to, move);
+        });
+        return [...map.values()];
+      }
+
+      async function requestPositionEval() {
+        const fen = chess.fen();
+        const token = fen;
+        try {
+          const result = await engine.analyze(fen, 10, "eval");
+          if (chess.fen() !== token) return;
+          const stmScore = scoreToPawns(result.score);
+          const sideToMove = fen.split(" ")[1];
+          const whiteEval = sideToMove === "w" ? stmScore : -stmScore;
+          currentWhiteEval = whiteEval;
+          updateEvalBar(whiteEval, result.score);
+        } catch (error) {
+          updateEvalBar(currentWhiteEval);
+        }
+      }
+
+      function updateEvalBar(whiteEval, rawScore = null) {
+        const clamped = Math.max(-6, Math.min(6, whiteEval));
+        const whitePercent = Math.max(3, Math.min(97, 50 + clamped * 7.6));
+        const blackPercent = 100 - whitePercent;
+
+        if (window.matchMedia("(max-width: 720px)").matches) {
+          evalWhiteEl.style.width = `${whitePercent}%`;
+          evalBlackEl.style.width = `${blackPercent}%`;
+        } else {
+          evalWhiteEl.style.height = `${whitePercent}%`;
+          evalBlackEl.style.height = `${blackPercent}%`;
+        }
+
+        evalValueEl.textContent = formatWhiteEval(whiteEval, rawScore);
+        if (Math.abs(whiteEval) < 0.18) {
+          evalTextEl.textContent = "Even position";
+        } else if (whiteEval > 0) {
+          evalTextEl.textContent = `White is better`;
+        } else {
+          evalTextEl.textContent = `Black is better`;
+        }
+      }
+
+      function render() {
+        renderBoard();
+        renderHistory();
+        undoBtn.disabled = botThinking || positionStack.length < 2;
+      }
+
+      function renderBoard() {
+        boardEl.innerHTML = "";
+        const rows = boardFlipped ? [7,6,5,4,3,2,1,0] : [0,1,2,3,4,5,6,7];
+        const cols = boardFlipped ? [7,6,5,4,3,2,1,0] : [0,1,2,3,4,5,6,7];
+        const legalTargets = new Set(legalMoves.map(m => m.to));
+        const captureTargets = new Set(legalMoves.filter(m => m.flags.includes("c") || m.flags.includes("e")).map(m => m.to));
+        const board = chess.board();
+        const kingSquare = chess.in_check() ? findKingSquare(chess.turn()) : null;
+
+        rows.forEach((r, visualRow) => {
+          cols.forEach((c, visualCol) => {
+            const squareName = files[c] + (8 - r);
+            const sq = document.createElement("div");
+            sq.className = `square ${(r + c) % 2 === 0 ? "light" : "dark"}`;
+            sq.dataset.square = squareName;
+
+            if (squareName === selectedSquare) sq.classList.add("selected");
+            if (lastMove && (squareName === lastMove.from || squareName === lastMove.to)) sq.classList.add("last");
+            if (squareName === kingSquare) sq.classList.add("check");
+            if (legalTargets.has(squareName)) sq.classList.add("legal");
+            if (captureTargets.has(squareName)) sq.classList.add("capture");
+
+            const piece = board[r][c];
+            if (piece) {
+              const pieceEl = document.createElement("span");
+              pieceEl.className = `piece ${piece.color}`;
+              pieceEl.textContent = pieceSymbols[piece.color][piece.type];
+              sq.appendChild(pieceEl);
+            }
+
+            const score = moveScores.get(squareName);
+            if (score) {
+              const badge = document.createElement("span");
+              badge.className = `move-badge ${score.loading ? "loading" : scoreClass(score.delta)}`;
+              badge.textContent = score.loading ? "..." : formatMoveScore(score.score);
+              sq.appendChild(badge);
+            }
+
+            if (visualCol === 0) {
+              const rank = document.createElement("span");
+              rank.className = "coord rank";
+              rank.textContent = 8 - r;
+              sq.appendChild(rank);
+            }
+            if (visualRow === 7) {
+              const file = document.createElement("span");
+              file.className = "coord file";
+              file.textContent = files[c];
+              sq.appendChild(file);
+            }
+
+            sq.addEventListener("click", () => onSquareClick(squareName));
+            boardEl.appendChild(sq);
+          });
+        });
+      }
+
+      function renderHistory() {
+        if (!reviewRows.length) {
+          historyEl.innerHTML = '<div class="empty">No moves yet.</div>';
+          return;
+        }
+        let html = "<table><tbody>";
+        for (let i = 0; i < reviewRows.length; i += 2) {
+          html += `<tr><td>${Math.floor(i / 2) + 1}.</td><td>${moveCell(reviewRows[i])}</td><td>${moveCell(reviewRows[i + 1])}</td></tr>`;
+        }
+        html += "</tbody></table>";
+        historyEl.innerHTML = html;
+        historyEl.scrollTop = historyEl.scrollHeight;
+      }
+
+      function moveCell(row) {
+        if (!row) return "";
+        return `<div class="move-cell"><span class="san">${escapeHtml(row.san)}</span><span class="tag ${row.tagClass}">${escapeHtml(row.tag)}</span></div>`;
+      }
+
+      function updateGameStatus() {
+        if (chess.in_checkmate()) {
+          const winner = chess.turn() === "w" ? "Black" : "White";
+          setStatus(`Checkmate. ${winner} wins.`);
+          return;
+        }
+        if (chess.in_stalemate()) {
+          setStatus("Stalemate. Draw.");
+          return;
+        }
+        if (chess.in_draw()) {
+          setStatus("Draw.");
+          return;
+        }
+        if (chess.in_check()) {
+          setStatus(isHumanTurn() ? "You are in check." : "Stockfish is in check.");
+          return;
+        }
+        setStatus(isHumanTurn() ? "Your move." : "Stockfish to move.");
+      }
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function openPromotionModal() {
+        document.querySelectorAll(".promo-options button").forEach(button => {
+          button.textContent = pieceSymbols[humanColor][button.dataset.promo];
+        });
+        promotionModal.classList.add("show");
+      }
+
+      function isHumanTurn() {
+        return gameStarted && chess.turn() === humanColor;
+      }
+
+      function findKingSquare(color) {
+        const board = chess.board();
+        for (let r = 0; r < 8; r++) {
+          for (let c = 0; c < 8; c++) {
+            const piece = board[r][c];
+            if (piece && piece.color === color && piece.type === "k") return files[c] + (8 - r);
+          }
+        }
+        return null;
+      }
+
+      function pickFallbackBotMove(legal, elo) {
+        if (!legal.length) return null;
+        if (elo >= 1500) return legal[Math.floor(Math.random() * Math.min(4, legal.length))];
+        return legal[Math.floor(Math.random() * legal.length)];
+      }
+
+      function eloToMoveTime(elo) {
+        if (elo <= 800) return 180;
+        if (elo <= 1000) return 260;
+        if (elo <= 1200) return 360;
+        if (elo <= 1500) return 520;
+        if (elo <= 1800) return 700;
+        if (elo <= 2200) return 1000;
+        return 1400;
+      }
+
+      function scoreClass(delta) {
+        if (delta >= 0.15) return "good";
+        if (delta > -0.45) return "ok";
+        return "bad";
+      }
+
+      function scoreToPawns(score) {
+        if (!score) return 0;
+        if (score.type === "mate") {
+          const sign = Math.sign(score.value || 1);
+          const distance = Math.min(10, Math.abs(score.value || 1));
+          return sign * (12 - distance * 0.35);
+        }
+        return (score.value || 0) / 100;
+      }
+
+      function formatWhiteEval(whiteEval, rawScore = null) {
+        if (rawScore && rawScore.type === "mate") {
+          const sideToMove = chess.turn();
+          const whiteMate = sideToMove === "w" ? rawScore.value : -rawScore.value;
+          return whiteMate > 0 ? `M${Math.abs(rawScore.value)}` : `-M${Math.abs(rawScore.value)}`;
+        }
+        if (Math.abs(whiteEval) < 0.005) return "0.00";
+        return `${whiteEval > 0 ? "+" : ""}${whiteEval.toFixed(2)}`;
+      }
+
+      function formatMoveScore(score) {
+        if (score === null || Number.isNaN(score)) return "?";
+        if (Math.abs(score) > 10) return score > 0 ? "+M" : "-M";
+        return `${score > 0 ? "+" : ""}${score.toFixed(1)}`;
+      }
+
+      function escapeHtml(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      class StockfishEngine {
+        constructor() {
+          this.worker = null;
+          this.queue = [];
+          this.current = null;
+          this.ready = false;
+          this.failed = false;
+          this.onStatus = null;
+          this.boot();
+        }
+
+        boot() {
+          try {
+            const blob = new Blob([`importScripts("${STOCKFISH_URL}");`], { type: "application/javascript" });
+            const workerUrl = URL.createObjectURL(blob);
+            this.worker = new Worker(workerUrl);
+            this.worker.onmessage = event => this.handleLine(String(event.data || event));
+            this.worker.onerror = () => {
+              this.failed = true;
+              this.status("failed to load. Check internet/CDN access.");
+            };
+            this.post("uci");
+            this.post("isready");
+            setTimeout(() => {
+              if (!this.failed) {
+                this.ready = true;
+                this.status("ready. Stockfish analysis enabled.");
+                this.pump();
+              }
+            }, 650);
+          } catch (error) {
+            this.failed = true;
+            this.status("unavailable in this browser.");
+          }
+        }
+
+        status(message) {
+          if (typeof this.onStatus === "function") this.onStatus(message);
+        }
+
+        post(command) {
+          if (this.worker && !this.failed) this.worker.postMessage(command);
+        }
+
+        analyze(fen, depth = 10, group = "normal") {
+          if (this.failed) return Promise.resolve({ score: { type: "cp", value: 0 }, bestmove: null });
+          return new Promise(resolve => {
+            this.queue.push({ type: "analyze", fen, depth, group, resolve, score: null, bestmove: null, timeout: null });
+            this.pump();
+          });
+        }
+
+        bestMove(fen, elo = 1100, movetime = 450) {
+          if (this.failed) return Promise.resolve({ bestmove: null, score: { type: "cp", value: 0 } });
+          return new Promise(resolve => {
+            this.queue.push({ type: "bestmove", fen, elo, movetime, group: "bot", resolve, score: null, bestmove: null, timeout: null });
+            this.pump();
+          });
+        }
+
+        cancelGroup(group) {
+          this.queue = this.queue.filter(task => task.group !== group);
+        }
+
+        pump() {
+          if (!this.ready || this.current || !this.queue.length || this.failed) return;
+          const task = this.queue.shift();
+          this.current = task;
+          task.score = null;
+          task.bestmove = null;
+
+          this.post("stop");
+          this.post("ucinewgame");
+
+          if (task.type === "bestmove") {
+            this.post("setoption name UCI_LimitStrength value true");
+            this.post(`setoption name UCI_Elo value ${task.elo}`);
+            this.post("setoption name Skill Level value " + Math.max(0, Math.min(20, Math.round((task.elo - 700) / 95))));
+          } else {
+            this.post("setoption name UCI_LimitStrength value false");
+            this.post("setoption name Skill Level value 20");
+          }
+
+          this.post(`position fen ${task.fen}`);
+          if (task.type === "bestmove") {
+            this.post(`go movetime ${task.movetime}`);
+          } else {
+            this.post(`go depth ${task.depth}`);
+          }
+
+          task.timeout = setTimeout(() => {
+            if (this.current === task) {
+              this.finishCurrent({ bestmove: task.bestmove, score: task.score || { type: "cp", value: 0 }, timeout: true });
+            }
+          }, task.type === "bestmove" ? Math.max(2200, task.movetime + 1400) : 5200);
+        }
+
+        handleLine(line) {
+          if (!line) return;
+          if (line === "uciok" || line === "readyok") {
+            this.ready = true;
+            this.pump();
+            return;
+          }
+
+          const task = this.current;
+          if (!task) return;
+
+          const scoreMatch = line.match(/score\s+(cp|mate)\s+(-?\d+)/);
+          if (scoreMatch) {
+            task.score = { type: scoreMatch[1], value: Number(scoreMatch[2]) };
+          }
+
+          const bestMatch = line.match(/^bestmove\s+(\S+)/);
+          if (bestMatch) {
+            task.bestmove = bestMatch[1] === "(none)" ? null : bestMatch[1];
+            this.finishCurrent({ bestmove: task.bestmove, score: task.score || { type: "cp", value: 0 } });
+          }
+        }
+
+        finishCurrent(result) {
+          const task = this.current;
+          if (!task) return;
+          clearTimeout(task.timeout);
+          this.current = null;
+          task.resolve(result);
+          setTimeout(() => this.pump(), 0);
+        }
+      }
+
+      engine = new StockfishEngine();
+      engine.onStatus = handleEngineStatus;
+
+      updateEvalBar(0);
+      render();
+    })();
+  </script>
+</body>
+</html>
